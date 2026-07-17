@@ -19,18 +19,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Menyembunyikan log polling HTTPX yang berulang agar terminal Railway bersih
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk command /start"""
     pesan = (
-        "Halo 👋 Masukkan nama negara yang ingin dicari.\n"
-        "Contoh:\nIndonesia\nThailand\nMalaysia\nJepang"
+        "Halo 👋 Masukkan nama negara atau kota yang ingin dicari.\n"
+        "Bot akan mencarikan akomodasi yang bisa dipesan **Tanpa Kartu Kredit**.\n\n"
+        "Contoh:\nIndonesia\nTokyo\nBali\nJerman"
     )
-    await update.message.reply_text(pesan)
+    await update.message.reply_text(pesan, parse_mode="Markdown")
 
-async def scrape_booking(country: str) -> list:
-    """Fungsi asynchronous untuk scraping data Booking.com dengan header yang ditingkatkan"""
-    url = f"https://www.booking.com/searchresults.id.html?ss={country}&lang=id"
+async def scrape_booking(location: str) -> list:
+    """Fungsi asynchronous untuk scraping data Booking.com"""
+    # Menggunakan URL bahasa Indonesia agar kita bisa mendeteksi teks "tanpa kartu kredit"
+    url = f"https://www.booking.com/searchresults.id.html?ss={location}&lang=id"
     
+    # Header untuk menyamar sebagai browser asli
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -68,6 +74,11 @@ async def scrape_booking(country: str) -> list:
                     
                     for prop in properties:
                         try:
+                            # Cek apakah di dalam kartu hotel ini terdapat tulisan "tanpa kartu kredit"
+                            # Booking biasanya menampilkan badge hijau bertuliskan "Pesan tanpa kartu kredit"
+                            if not re.search(r'tanpa kartu kredit', prop.text, re.IGNORECASE):
+                                continue # Jika tidak ada, lewati hotel ini
+                            
                             title_elem = prop.find('div', {'data-testid': 'title'})
                             title = title_elem.text.strip() if title_elem else "Hotel Tanpa Nama"
                             
@@ -78,7 +89,7 @@ async def scrape_booking(country: str) -> list:
                             link = link.split('?')[0] 
                                 
                             rating_elem = prop.find('div', {'data-testid': 'review-score'})
-                            rating = "N/A"
+                            rating = "0.0"
                             if rating_elem:
                                 match = re.search(r'(\d+[.,]\d+)', rating_elem.text)
                                 if match:
@@ -87,31 +98,19 @@ async def scrape_booking(country: str) -> list:
                             price_elem = prop.find('span', {'data-testid': 'price-and-discounted-price'})
                             price = price_elem.text.strip() if price_elem else "Harga tidak tersedia"
                             
-                            reward_value = 0
-                            badges = prop.find_all(string=re.compile(r'%|Diskon|Reward|Promo|Penawaran', re.IGNORECASE))
-                            
-                            for text in badges:
-                                val_match = re.search(r'(\d+)\s*%', text)
-                                if val_match:
-                                    reward_value = int(val_match.group(1))
-                                    break
-                                else:
-                                    reward_value = 1 
-                                    
-                            if reward_value > 0:
-                                results.append({
-                                    "title": title,
-                                    "rating": rating,
-                                    "price": price,
-                                    "link": link,
-                                    "reward_value": reward_value if reward_value > 1 else "Spesial"
-                                })
+                            results.append({
+                                "title": title,
+                                "rating": rating,
+                                "price": price,
+                                "link": link
+                            })
                                 
                         except Exception as e:
                             continue
                             
                     if results:
-                        results.sort(key=lambda x: x['reward_value'] if isinstance(x['reward_value'], int) else 0, reverse=True)
+                        # Urutkan berdasarkan rating tertinggi ke terendah
+                        results.sort(key=lambda x: float(x['rating']) if x['rating'] != "N/A" else 0.0, reverse=True)
                         return results[:10]
                     
             except Exception as e:
@@ -122,26 +121,26 @@ async def scrape_booking(country: str) -> list:
         return []
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk menangani input nama negara dari user"""
-    country = update.message.text.strip()
+    """Handler untuk menangani input lokasi dari user"""
+    location = update.message.text.strip()
     
-    if not country:
+    if not location:
         return
         
-    await update.message.reply_text(f"🔍 Sedang mencari akomodasi dengan Travel Reward di {country}...\nMohon tunggu sebentar.")
+    await update.message.reply_text(f"🔍 Sedang mencari akomodasi **Tanpa Kartu Kredit** di {location}...\nMohon tunggu sebentar.", parse_mode="Markdown")
     
-    results = await scrape_booking(country)
+    results = await scrape_booking(location)
     
     if not results:
-        await update.message.reply_text("❌ Tidak ditemukan akomodasi dengan Travel Reward di negara tersebut.")
+        await update.message.reply_text(f"❌ Tidak ditemukan akomodasi yang bisa dipesan tanpa kartu kredit di wilayah tersebut saat ini.")
         return
         
-    msg = f"🏨 Top {len(results)} Travel Reward\nNegara: {country}\n\n"
+    msg = f"🏨 Top {len(results)} Akomodasi Tanpa Kartu Kredit\nLokasi: {location}\n\n"
     for i, res in enumerate(results, 1):
         msg += f"{i}. {res['title']}\n"
-        # Menyesuaikan tampilan reward jika berupa teks "Spesial" atau angka persentase
-        reward_display = f"{res['reward_value']}%" if isinstance(res['reward_value'], int) else res['reward_value']
-        msg += f"⭐ {res['rating']} 💰 {res['price']} 🎁 Travel Reward: {reward_display}\n"
+        rating_display = f"⭐ {res['rating']}" if res['rating'] != "0.0" else "⭐ Baru/Belum ada rating"
+        msg += f"{rating_display} 💰 {res['price']}\n"
+        msg += f"✅ Bebas Kartu Kredit\n"
         msg += f"{res['link']}\n\n"
         
     await update.message.reply_text(msg, disable_web_page_preview=True)
