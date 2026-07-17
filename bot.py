@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode, ChatAction
 from datetime import datetime, timedelta
 
 # Load Environment Variables
@@ -23,36 +24,36 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pesan sambutan yang lebih ramah dan profesional"""
     pesan = (
-        "Halo 👋 Masukkan nama negara atau kota yang ingin dicari.\n"
-        "Bot akan mencarikan akomodasi yang bisa dipesan **Tanpa Kartu Kredit**.\n\n"
-        "Contoh:\nIndonesia\nTokyo\nBali\nJerman"
+        "🏨 <b>Selamat datang di Booking Assistant Bot!</b>\n\n"
+        "Saya dapat membantu Anda menemukan penginapan terbaik yang bisa dipesan <b>Tanpa Kartu Kredit</b>.\n\n"
+        "👇 <b>Cara Penggunaan:</b>\n"
+        "Ketikkan nama <b>Kota</b> atau <b>Negara</b> yang Anda tuju.\n"
+        "<i>Contoh: Tokyo, Bali, Paris, Jakarta</i>"
     )
-    await update.message.reply_text(pesan, parse_mode="Markdown")
+    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
-async def scrape_booking(location: str) -> list:
-    # Set tanggal check-in besok dan check-out lusa agar Booking.com mau memunculkan data
+async def scrape_booking(location: str) -> dict:
+    """Fungsi scraping yang mengembalikan dictionary berisi data dan tanggal"""
     besok = datetime.now() + timedelta(days=1)
     lusa = datetime.now() + timedelta(days=2)
     checkin = besok.strftime("%Y-%m-%d")
     checkout = lusa.strftime("%Y-%m-%d")
     
-    # URL Target Asli Booking.com
-    target_url = f"https://www.booking.com/searchresults.id.html?ss={location}&lang=id&checkin={checkin}&checkout={checkout}"
+    target_url = f"https://www.booking.com/searchresults.id.html?ss={location}&checkin={checkin}&checkout={checkout}"
     
-    # Menggunakan ScraperAPI untuk menembus blokir
     scraper_api_url = "http://api.scraperapi.com"
     payload = {
         'api_key': SCRAPERAPI_KEY,
         'url': target_url,
-        'render': 'true' # Memaksa sistem merender JavaScript Booking.com
+        'render': 'true'
     }
     
-    # Timeout diperpanjang karena proses proxy/rendering butuh waktu ekstra
-    timeout = aiohttp.ClientTimeout(total=45)
+    timeout = aiohttp.ClientTimeout(total=60)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(2): # 2 kali percobaan sudah cukup untuk API
+        for attempt in range(2): 
             try:
                 async with session.get(scraper_api_url, params=payload) as response:
                     if response.status != 200:
@@ -67,8 +68,11 @@ async def scrape_booking(location: str) -> list:
                     results = []
                     for prop in properties:
                         try:
-                            # Filter: Hanya ambil jika ada teks tanpa kartu kredit
-                            if not re.search(r'(tanpa kartu kredit|bebas kartu kredit)', prop.text, re.IGNORECASE):
+                            teks_card = prop.text.lower()
+                            
+                            # Filter Bahasa Indonesia dan Inggris
+                            kata_kunci = ['tanpa kartu kredit', 'bebas kartu kredit', 'no credit card', 'without credit card']
+                            if not any(kunci in teks_card for kunci in kata_kunci):
                                 continue 
                             
                             title_elem = prop.find('div', {'data-testid': 'title'})
@@ -100,41 +104,80 @@ async def scrape_booking(location: str) -> list:
                             continue
                             
                     if results:
-                        # Urutkan berdasarkan rating tertinggi ke terendah
                         results.sort(key=lambda x: float(x['rating']) if x['rating'] != "N/A" else 0.0, reverse=True)
-                        return results[:10]
-            except asyncio.TimeoutError:
-                logger.error(f"Attempt {attempt+1}: Timeout saat mengambil data dari API")
+                        return {"results": results[:10], "checkin": checkin, "checkout": checkout}
             except Exception as e:
                 logger.error(f"Attempt {attempt+1}: Error - {e}")
             await asyncio.sleep(2)
-        return []
+            
+        return {"results": [], "checkin": checkin, "checkout": checkout}
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani permintaan user dengan UI yang profesional"""
     if not SCRAPERAPI_KEY:
-        await update.message.reply_text("⚠️ Sistem belum dikonfigurasi sepenuhnya. `SCRAPERAPI_KEY` tidak ditemukan.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ <i>Sistem belum dikonfigurasi sepenuhnya. SCRAPERAPI_KEY tidak ditemukan.</i>", parse_mode=ParseMode.HTML)
         return
 
     location = update.message.text.strip()
     if not location:
         return
         
-    await update.message.reply_text(f"🔍 Sedang mencari akomodasi **Tanpa Kartu Kredit** di {location}...\n*(Proses ini mungkin memakan waktu hingga 30 detik untuk menembus proteksi)*", parse_mode="Markdown")
-    results = await scrape_booking(location)
+    # 1. Kirim pesan loading awal
+    loading_msg = await update.message.reply_text(
+        f"🔍 <i>Sedang menganalisis ketersediaan kamar di <b>{location}</b>...\n(Mohon tunggu ± 30-60 detik)</i>", 
+        parse_mode=ParseMode.HTML
+    )
     
+    # 2. Munculkan efek "sedang mengetik..." di Telegram user
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    # 3. Proses pencarian
+    data = await scrape_booking(location)
+    results = data.get("results", [])
+    
+    # 4. Jika gagal, edit pesan loading menjadi pesan error
     if not results:
-        await update.message.reply_text(f"❌ Tidak ditemukan akomodasi yang bisa dipesan tanpa kartu kredit di wilayah tersebut saat ini.", parse_mode="Markdown")
+        fail_msg = (
+            f"❌ <b>Pencarian Gagal</b>\n\n"
+            f"Maaf, kami tidak dapat menemukan akomodasi <i>Tanpa Kartu Kredit</i> di <b>{location}</b> saat ini.\n"
+            f"Silakan coba masukkan wilayah atau kota lain."
+        )
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, 
+            message_id=loading_msg.message_id, 
+            text=fail_msg, 
+            parse_mode=ParseMode.HTML
+        )
         return
         
-    msg = f"🏨 Top {len(results)} Akomodasi Tanpa Kartu Kredit\nLokasi: {location}\n\n"
+    # 5. Format tanggal untuk tampilan UI
+    tgl_in = datetime.strptime(data['checkin'], "%Y-%m-%d").strftime("%d %b %Y")
+    
+    # 6. Format hasil pencarian menjadi list elegan
+    final_msg = (
+        f"🎯 <b>Rekomendasi Akomodasi Pilihan</b>\n"
+        f"📍 <b>Lokasi:</b> {location.title()}\n"
+        f"📅 <b>Check-in:</b> {tgl_in} (1 Malam)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
     for i, res in enumerate(results, 1):
-        msg += f"{i}. {res['title']}\n"
-        rating_display = f"⭐ {res['rating']}" if res['rating'] != "0.0" else "⭐ Baru/Belum ada rating"
-        msg += f"{rating_display} 💰 {res['price']}\n"
-        msg += f"✅ Bebas Kartu Kredit\n"
-        msg += f"{res['link']}\n\n"
+        rating_display = f"⭐ {res['rating']}" if res['rating'] != "0.0" else "⭐ (Baru)"
         
-    await update.message.reply_text(msg, disable_web_page_preview=True)
+        # Link disematkan ke dalam nama hotel agar tidak merusak pemandangan chat
+        final_msg += f"<b>{i}. <a href='{res['link']}'>{res['title']}</a></b>\n"
+        final_msg += f"└ {rating_display} | 💰 <b>{res['price']}</b>\n\n"
+        
+    final_msg += "<i>💡 Klik nama akomodasi di atas untuk melihat detail dan memesan (Bebas Kartu Kredit).</i>"
+    
+    # 7. Edit pesan loading menjadi hasil akhir yang rapi
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id, 
+        message_id=loading_msg.message_id, 
+        text=final_msg, 
+        parse_mode=ParseMode.HTML, 
+        disable_web_page_preview=True # Mematikan preview link otomatis yang membuat chat penuh
+    )
 
 def main():
     if not BOT_TOKEN:
